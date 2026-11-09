@@ -1,5 +1,5 @@
 # Starting pruning recipe; tune penalty_lmbda for the desired sparsity/accuracy.
-model: sew_resnet18_imagenet
+model: sew_resnet18
 dataset: MSTAR
 data_path: ./datasets/MSTAR/soc
 output_dir: ./logs/sew_resnet18_mstar_prune

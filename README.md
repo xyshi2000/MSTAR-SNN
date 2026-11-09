@@ -1,6 +1,6 @@
 # SparseNeuron
 
-SEW-ResNet 神经元剪枝，支持 CIFAR、ImageNet 和 MSTAR。
+面向 MSTAR SOC 十类数据的 SEW-ResNet 训练与神经元剪枝。
 
 ## 环境
 
@@ -31,7 +31,7 @@ soc/
 `--no-aug` 可关闭平移增强。预处理参数和类别映射保存在 `config.json` 与 checkpoint
 的 `mstar_metadata` 字段中，恢复及独立评估使用这些参数并核对类别。
 
-默认模型为单通道 `sew_resnet18_imagenet`，使用标准 7×7 stem、LIF 脉冲神经元
+默认模型为单通道 `sew_resnet18`，使用标准 7×7 stem、LIF 脉冲神经元
 和十类分类头（含原有 boost 读出）。所有 SEW 模型统一使用 LIF，默认 tau=2、阈值=1、
 复位电位=0、ATan 代理梯度，采用多步 CuPy 后端。静态图像重复 T=4 步，对 logits 取时间平均，
 每个 batch 后重置膜电位。它与参考目录中的 post-add LIF ResNet-18 结构不同，
@@ -45,7 +45,7 @@ soc/
 # 普通训练：100 轮，无剪枝、无微调。
 python main.py --config configs/image_classification/sew_resnet18_mstar_train.yaml --data-path /path/to/soc
 
-# 从头剪枝：100 轮搜索连续掩码，再固定二值掩码微调 40 轮。
+# 从头剪枝：100 轮搜索连续掩码，再固定二值掩码微调 20 轮。
 python main.py --config configs/image_classification/sew_resnet18_mstar_prune.yaml --data-path /path/to/soc
 ```
 
@@ -83,6 +83,7 @@ MSTAR 配置开启 `eval_final_only`：训练和微调期间不读取测试图�
 
 恢复时使用原实验 YAML 和对应阶段。`checkpoint_latest.pth` 的 `phase` 是 `search`
 或 `finetune`，必须与 `--resume-type` 匹配；普通训练也属于 `search` 阶段。
+旧 MSTAR checkpoint 中带 `_imagenet` 后缀的模型名会自动转换为当前名称，权重结构不变。
 checkpoint 会恢复模型类型、时间步、剪枝开关、评估方式及预处理，其他训练参数使用
 指定 YAML/命令行。恢复优化器、调度器与 scaler，但不保证随机序列逐步复现。
 

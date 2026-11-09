@@ -7,10 +7,7 @@ import torch
 import torch.utils.data
 import numpy as np
 from torch import nn
-import torchvision
-from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
-from thop import profile
 from math import ceil, sqrt
 from torch.amp import autocast, GradScaler
 import torch.distributed
@@ -28,38 +25,37 @@ from models.submodules.sparse import ConvBlock, Mask
 from sparsity.penalty_term import PenaltyTerm
 from sparsity.temp_scheduler import TemperatureScheduler
 from utils import RecordDict, GlobalTimer, Timer
-from utils import DatasetSplitter, CriterionWarpper, DVStransform, SOPMonitor, CIFAR10Policy, Cutout, Augment, DatasetWarpper
+from utils import CriterionWarpper, SOPMonitor
 from utils import left_neurons, init_mask, set_pruning_mode
 from utils import is_main_process, save_on_master, search_tb_record, finetune_tb_record, accuracy, safe_makedirs
 from spikingjelly.activation_based import functional
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description='Training')
+    parser = argparse.ArgumentParser(description='MSTAR training and neuron pruning')
     parser.add_argument('--config', help='YAML training configuration')
 
     # training options
-    parser.add_argument('--seed', default=12450, type=int)
-    parser.add_argument('--epoch-search', default=280, type=int)
-    parser.add_argument('--epoch-finetune', default=40, type=int,
+    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--epoch-search', default=100, type=int)
+    parser.add_argument('--epoch-finetune', default=20, type=int,
                         help='when to fine tune, -1 means will not fine tune')
     parser.add_argument('--not-prune-neuron', action='store_true')
-    parser.add_argument('-b', '--batch-size', default=256, type=int)
+    parser.add_argument('-b', '--batch-size', default=64, type=int)
     parser.add_argument('--T', default=4, type=int, help='simulation steps')
-    parser.add_argument('--model', default='sew_resnet18_cifar', help='model type')
-    parser.add_argument('--dataset', default='CIFAR10',
-                        help='CIFAR10, CIFAR10-128, CIFAR100, CIFAR10DVS, ImageNet or MSTAR')
+    parser.add_argument('--model', default='sew_resnet18', help='model type')
+    parser.add_argument('--dataset', default='MSTAR', choices=['MSTAR'], help='MSTAR SOC dataset')
     parser.add_argument('--augment', action='store_true', default=True, help='Additional augment')
-    parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('--workers', default=16, type=int, metavar='N',
-                        help='number of data loading workers (default: 16)')
-    parser.add_argument('--search-lr', default=0.1, type=float, help='initial learning rate')
-    parser.add_argument('--finetune-lr', default=1e-3, type=float, help='finetune learning rate')
+    parser.add_argument('--device', default='cuda', choices=['cuda'], help='device')
+    parser.add_argument('--workers', default=4, type=int, metavar='N',
+                        help='number of data loading workers (default: 4)')
+    parser.add_argument('--search-lr', default=0.001, type=float, help='initial learning rate')
+    parser.add_argument('--finetune-lr', default=0.0001, type=float, help='finetune learning rate')
     parser.add_argument('--prune-lr', type=float, help='initial learning rate of pruning')
-    parser.add_argument('--optimizer', type=str, default='SGD', help='SGD, Adam or AdamW (case insensitive)')
+    parser.add_argument('--optimizer', type=str, default='AdamW', help='SGD, Adam or AdamW (case insensitive)')
     parser.add_argument('--nesterov', action='store_true', help='Use Nesterov momentum for SGD')
     parser.add_argument('--prune-optimizer', type=str, help='SGD, Adam or AdamW (case insensitive)')
-    parser.add_argument('--weight-decay', default=2e-4, type=float, help='weight decay (default: 2e-4)')
+    parser.add_argument('--weight-decay', default=0.0001, type=float, help='weight decay (default: 0.0001)')
     parser.add_argument('--prune-weight-decay', default=0, type=float)
     parser.add_argument(
         '--search-lr-scheduler', type=str, nargs='+', default=['Cosine'],
@@ -72,7 +68,7 @@ def parse_args(argv=None):
     parser.add_argument('--print-freq', default=5, type=int,
                         help='Number of times a debug message is printed in one epoch')
     parser.add_argument('--tb-interval', type=int, default=10)
-    parser.add_argument('--data-path', default='./datasets', help='dataset')
+    parser.add_argument('--data-path', default='./datasets/MSTAR/soc', help='dataset')
     parser.add_argument('--output-dir', default='./logs/temp')
     parser.add_argument('--resume', type=str, help='resume from checkpoint')
     parser.add_argument('--resume-type', type=str, default='test', help='search, finetune or test')
@@ -80,44 +76,13 @@ def parse_args(argv=None):
 
     parser.add_argument('--no-aug', action='store_true', help='no augmentation')
     parser.add_argument('--label-smoothing', default=0.0, type=float)
-    parser.add_argument('--input-size', type=int, nargs=3, default=[3, 224, 224],
-                        help='input shape for advanced ImageNet augmentation')
-
-    # ImageNet augmentations
-    parser.add_argument('--advanced-aug', action='store_true', help='use advanced augmentations')
-    parser.add_argument('--re-prob', default=0, type=float, help='random erasing prob')
-    parser.add_argument('--re-mode', default='pixel', type=str, help='random erasing mode')
-    parser.add_argument('--re-count', default=1, type=int, help='random erasing count')
-    parser.add_argument('--re-split', action='store_true', help='random erasing split')
-    parser.add_argument('--scale', default=[0.08, 1.0], type=float, nargs='+',
-                        help='input re-scale')
-    parser.add_argument('--ratio', default=[3.0 / 4.0, 4.0 / 3.0], type=float, nargs='+',
-                        help='input re-ratio')
-    parser.add_argument('--hflip', default=0.5, type=float, help='horizontal flip prob')
-    parser.add_argument('--vflip', default=0.0, type=float, help='vertical flip prob')
-    parser.add_argument('--color-jitter', default=0.4, type=float, help='color jitter')
-    parser.add_argument('--auto-augment', default='rand-m7-mstd0.5-inc1', type=str,
-                        help='auto augment policy')
-    parser.add_argument('--num-aug-repeats', default=0, type=int, help='auto augment repeat')
-    parser.add_argument('--num-aug-splits', default=0, type=int, help='auto augment split')
-    parser.add_argument('--crop-pct', default=0.875, type=float)
-    parser.add_argument('--crop-pct-eval', default=None, type=float)
-    parser.add_argument('--crop-mode', default='random', type=str)
-
-    parser.add_argument('--mixup-alpha', default=0.0, type=float)
-    parser.add_argument('--cutmix-alpha', default=0.0, type=float)
-    parser.add_argument('--cutmix-minmax', default=None, type=float, nargs='+')
-    parser.add_argument('--mixup-prob', default=1.0, type=float)
-    parser.add_argument('--mixup-switch-prob', default=0.5, type=float)
-    parser.add_argument('--mixup-mode', default='batch', type=str)
-
     # mask init
     parser.add_argument(
         '--mask-init-factor', type=float, nargs='+', default=[0, 0],
         help='--mask-init-factor <neurons mean> <neurons std>')
 
     # penalty term
-    parser.add_argument('--penalty-lmbda', type=float, default=1e-11)
+    parser.add_argument('--penalty-lmbda', type=float, default=1e-5)
 
     parser.add_argument(
         '--temp-scheduler', type=float, nargs='+', default=[5, 1000],
@@ -129,9 +94,6 @@ def parse_args(argv=None):
     # argument of sew resnet
     parser.add_argument('--zero-init-residual', action='store_true',
                         help='zero init all residual blocks')
-    parser.add_argument(
-        "--cache-dataset", action="store_true",
-        help="Cache the datasets for quicker initialization. It also serializes the transforms")
     parser.add_argument("--sync-bn", action="store_true", help="Use sync batch norm")
     parser.add_argument("--test-only", action="store_true", help="Only test the model")
     parser.add_argument('--amp', action='store_true', default=True, help='Use AMP training')
@@ -142,7 +104,7 @@ def parse_args(argv=None):
     parser.add_argument('--TET-lambda', type=float, default=0.0)
 
     parser.add_argument('--save-latest', action='store_true')
-    parser.add_argument('--eval-final-only', action='store_true',
+    parser.add_argument('--eval-final-only', action='store_true', default=True,
                         help='Evaluate test data only after the final training phase')
 
     # Register explicit negative forms for every existing boolean option.
@@ -199,6 +161,9 @@ def parse_args(argv=None):
         parser.error('Invalid epoch count')
     if args.T < 1 or args.batch_size < 1 or args.accumulate_step < 1:
         parser.error('T, batch-size and accumulate-step must be positive')
+    if args.dataset != 'MSTAR':
+        parser.error('Only the MSTAR dataset is supported')
+    args.model = args.model.removesuffix('_imagenet')
     return args
 
 
@@ -295,195 +260,21 @@ def init_distributed(logger: logging.Logger, distributed_init_mode):
     return True, rank, world_size, local_rank
 
 
-def _get_cache_path(filepath):
-    import hashlib
-    h = hashlib.sha1(filepath.encode()).hexdigest()
-    cache_path = os.path.join("~", ".torch", "vision", "datasets", "imagefolder", h[:10] + ".pt")
-    cache_path = os.path.expanduser(cache_path)
-    return cache_path
-
-
-def _load_basic_data(dataset_dir, cache_dataset, dataset_type, distributed: bool, augment: bool,
-              logger: logging.Logger, T: int):
-
-    if dataset_type in ('CIFAR10', 'CIFAR10-128'):
-        resize = ([transforms.Resize((128, 128), antialias=True,
-                                     interpolation=transforms.InterpolationMode.BICUBIC)]
-                  if dataset_type == 'CIFAR10-128' else [])
-        if augment:
-            transform_train = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                CIFAR10Policy(),
-                *resize,
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
-                Cutout(n_holes=1, length=64 if dataset_type == 'CIFAR10-128' else 16), ])
-        else:
-            transform_train = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                *resize,
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)), ])
-        transform_test = transforms.Compose([
-            *resize,
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)), ])
-
-        dataset = torchvision.datasets.CIFAR10(root=os.path.join(dataset_dir), train=True,
-                                               download=True)
-        dataset_test = torchvision.datasets.CIFAR10(root=os.path.join(dataset_dir), train=False,
-                                                    download=True)
-    elif dataset_type == 'CIFAR100':
-        if augment:
-            transform_train = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                CIFAR10Policy(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[n / 255. for n in [129.3, 124.1, 112.4]],
-                                     std=[n / 255. for n in [68.2, 65.4, 70.4]]),
-                Cutout(n_holes=1, length=8), ])
-        else:
-            transform_train = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[n / 255. for n in [129.3, 124.1, 112.4]],
-                                     std=[n / 255. for n in [68.2, 65.4, 70.4]]), ])
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[n / 255. for n in [129.3, 124.1, 112.4]],
-                                 std=[n / 255. for n in [68.2, 65.4, 70.4]]), ])
-
-        dataset = torchvision.datasets.CIFAR100(root=os.path.join(dataset_dir), train=True,
-                                                download=True)
-        dataset_test = torchvision.datasets.CIFAR100(root=os.path.join(dataset_dir), train=False,
-                                                     download=True)
-    elif dataset_type == 'CIFAR10DVS':
-        from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
-        resize = transforms.Resize(size=(48, 48), antialias=True,
-                                   interpolation=transforms.InterpolationMode.BICUBIC)
-        if augment:
-            transform_train = DVStransform(transform=transforms.Compose([resize, Augment()]))
-        else:
-            transform_train = DVStransform(transform=resize)
-        transform_test = DVStransform(transform=resize)
-
-        dataset = CIFAR10DVS(dataset_dir, data_type='frame', frames_number=T, split_by='number')
-        dataset, dataset_test = DatasetSplitter(dataset, 0.9,
-                                                True), DatasetSplitter(dataset, 0.1, False)
-    elif dataset_type == 'ImageNet':
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        logger.info('Loading training data')
-        traindir = os.path.join(dataset_dir, 'train')
-        valdir = os.path.join(dataset_dir, 'val')
-        transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(224, antialias=True, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize, ])
-        if not augment:
-            transform_train = transforms.Compose([
-                transforms.Resize((224, 224), antialias=True, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.ToTensor(), normalize])
-        transform_test = transforms.Compose([
-            transforms.Resize((256, 256), antialias=True, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize, ])
-        with Timer('Load training data', logger):
-            cache_path = _get_cache_path(traindir)
-            if cache_dataset and os.path.exists(cache_path):
-                # Attention, as the transforms are also cached!
-                dataset, _ = torch.load(cache_path)
-                logger.info("Loaded training dataset from {}".format(cache_path))
-            else:
-                dataset = torchvision.datasets.ImageFolder(traindir)
-                if cache_dataset:
-                    safe_makedirs(os.path.dirname(cache_path))
-                    save_on_master((dataset, traindir), cache_path)
-                    logger.info("Cached training dataset to {}".format(cache_path))
-                logger.info("Loaded training dataset")
-
-        logger.info("Loading validation data")
-        with Timer('Load validation data', logger):
-            cache_path = _get_cache_path(valdir)
-            if cache_dataset and os.path.exists(cache_path):
-                # Attention, as the transforms are also cached!
-                dataset_test, _ = torch.load(cache_path)
-                logger.info("Loaded test dataset from {}".format(cache_path))
-            else:
-                dataset_test = torchvision.datasets.ImageFolder(valdir)
-                if cache_dataset:
-                    safe_makedirs(os.path.dirname(cache_path))
-                    save_on_master((dataset_test, valdir), cache_path)
-                    logger.info("Cached test dataset to {}".format(cache_path))
-                logger.info("Loaded test dataset")
-    else:
-        raise ValueError(dataset_type)
-
-    dataset_train = DatasetWarpper(dataset, transform_train)
-    dataset_test = DatasetWarpper(dataset_test, transform_test)
-
-    if distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train, drop_last=True)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset_train)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-
-    return dataset_train, dataset_test, train_sampler, test_sampler
-
-
-def load_data(dataset_dir, dataset_type, distributed, args, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    augment = args.augment and not args.no_aug
-    if dataset_type == 'MSTAR':
-        dataset_train, dataset_test, args.mstar_metadata = load_mstar(
-            dataset_dir, augment, getattr(args, 'mstar_metadata', None), args.test_only)
-        data_loader_train = None
-        if dataset_train is not None:
-            sampler = (torch.utils.data.distributed.DistributedSampler(dataset_train)
-                       if distributed else torch.utils.data.RandomSampler(dataset_train))
-            data_loader_train = torch.utils.data.DataLoader(
-                dataset_train, batch_size=args.batch_size, sampler=sampler,
-                num_workers=args.workers, pin_memory=True, drop_last=True)
-        # Final evaluation runs on rank zero over the complete test split.
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-    elif dataset_type == 'ImageNet' and args.advanced_aug:
-        # Optional dependency: the basic recipes do not require timm.
-        from timm.data import create_loader
-        dataset_train = torchvision.datasets.ImageFolder(os.path.join(dataset_dir, 'train'))
-        dataset_test = torchvision.datasets.ImageFolder(os.path.join(dataset_dir, 'val'))
-        common = dict(input_size=args.input_size, batch_size=args.batch_size,
-                      use_prefetcher=False, interpolation='bicubic',
-                      mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),
-                      num_workers=args.workers, distributed=distributed, pin_memory=True,
-                      persistent_workers=args.workers > 0)
-        data_loader_train = create_loader(
-            dataset_train, is_training=True, no_aug=not augment, re_prob=args.re_prob,
-            re_mode=args.re_mode, re_count=args.re_count, re_split=args.re_split,
-            scale=args.scale, ratio=args.ratio, hflip=args.hflip, vflip=args.vflip,
-            color_jitter=args.color_jitter, auto_augment=args.auto_augment,
-            num_aug_repeats=args.num_aug_repeats, num_aug_splits=args.num_aug_splits,
-            crop_pct=args.crop_pct, **common)
-        data_loader_test = create_loader(
-            dataset_test, is_training=False,
-            crop_pct=args.crop_pct_eval if args.crop_pct_eval is not None else args.crop_pct,
-            crop_mode=args.crop_mode, **common)
-    else:
-        dataset_train, dataset_test, train_sampler, test_sampler = _load_basic_data(
-            dataset_dir, args.cache_dataset, dataset_type, distributed, augment, logger, args.T)
+def load_data(dataset_dir, distributed, args):
+    dataset_train, dataset_test, args.mstar_metadata = load_mstar(
+        dataset_dir, args.augment and not args.no_aug,
+        getattr(args, 'mstar_metadata', None), args.test_only)
+    data_loader_train = None
+    if dataset_train is not None:
+        sampler = (torch.utils.data.distributed.DistributedSampler(dataset_train)
+                   if distributed else torch.utils.data.RandomSampler(dataset_train))
         data_loader_train = torch.utils.data.DataLoader(
-            dataset_train, batch_size=args.batch_size, sampler=train_sampler,
+            dataset_train, batch_size=args.batch_size, sampler=sampler,
             num_workers=args.workers, pin_memory=True, drop_last=True)
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, batch_size=args.batch_size, sampler=test_sampler,
-            num_workers=args.workers, pin_memory=True, drop_last=False)
+    # Final evaluation runs on rank zero over the complete test split.
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
     return dataset_train, dataset_test, data_loader_train, data_loader_test
 
 
@@ -614,7 +405,7 @@ def measure_inference_time(model, data_loader, warmup_steps=5):
     return elapsed_seconds * 1000 / samples
 
 
-def test(model, dataset_type, data_loader_test, inputs, args, logger):
+def test(model, data_loader_test, inputs, args, logger):
 
     safe_makedirs(os.path.join(args.output_dir, 'test'))
 
@@ -670,12 +461,6 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
     logger.info('Acc@1: {:.5f}, Acc@5: {:.5f}'.format(metric_dict['acc@1'].ave,
                                                       metric_dict['acc@5'].ave))
 
-    ### FIXME: count ops and params of ConvBlock
-    #ops, params = profile(model, inputs=(inputs, ), verbose=False)
-    #ops, params = (ops / (1000**3)) / args.T, params / (1000**2)
-    #functional.reset_net(model)
-    #logger.info('MACs: {:.5f} G, params: {:.2f} M.'.format(ops, params))
-
     sops = 0
     for name in mon.monitored_layers:
         sublist = mon[name]
@@ -699,7 +484,6 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
                    'inference_batch_size': args.batch_size,
                    'inference_warmup_steps': 5,
                    'sops_g_per_image': sops}, file, indent=2)
-    #logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
 
     #
     # visualize neurons
@@ -745,21 +529,17 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
         plt.close()
 
 
-def create_model_and_inputs(args, num_classes):
+def create_model_and_inputs(args):
     """Use the same architecture and mask geometry for training and evaluation."""
     if args.model not in sew_resnet.__all__:
         raise ValueError('Unsupported model: {}'.format(args.model))
     model = sew_resnet.__dict__[args.model](
-        zero_init_residual=args.zero_init_residual, T=args.T, num_classes=num_classes,
-        in_channels=1 if args.dataset == 'MSTAR' else 3).cuda()
+        zero_init_residual=args.zero_init_residual, T=args.T, num_classes=10, in_channels=1).cuda()
     if args.not_prune_neuron:
         for module in model.modules():
             if isinstance(module, ConvBlock):
                 module.sparse_neurons = False
-    shapes = {'CIFAR10': (1, 3, 32, 32), 'CIFAR100': (1, 3, 32, 32),
-              'CIFAR10-128': (1, 3, 128, 128), 'CIFAR10DVS': (1, 1, 2, 48, 48),
-              'ImageNet': (1, 3, 224, 224), 'MSTAR': (1, 1, 128, 128)}
-    return model, torch.rand(*shapes[args.dataset], device='cuda')
+    return model, torch.rand(1, 1, 128, 128, device='cuda')
 
 
 def main():
@@ -779,7 +559,7 @@ def main():
             if key in saved_config:
                 setattr(args, key, saved_config[key])
         args.mstar_metadata = resume_checkpoint.get('mstar_metadata')
-        if args.dataset == 'MSTAR' and args.mstar_metadata is None:
+        if args.mstar_metadata is None:
             raise ValueError('MSTAR checkpoint is missing preprocessing metadata')
         if not args.test_only and resume_checkpoint.get('phase', args.resume_type) != args.resume_type:
             raise ValueError('Resume type does not match checkpoint phase')
@@ -802,18 +582,11 @@ def main():
 
     # load data
 
-    dataset_type = args.dataset
-    if dataset_type in ('CIFAR10', 'CIFAR10-128', 'CIFAR10DVS', 'MSTAR'):
-        num_classes = 10
-    elif dataset_type == 'CIFAR100':
-        num_classes = 100
-    elif dataset_type == 'ImageNet':
-        num_classes = 1000
-    else:
-        raise ValueError('Unsupported dataset: {}'.format(dataset_type))
-
+    if args.dataset != 'MSTAR':
+        raise ValueError('Only MSTAR checkpoints are supported')
+    args.model = args.model.removesuffix('_imagenet')
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
-        args.data_path, dataset_type, distributed, args, logger)
+        args.data_path, distributed, args)
     logger.info('dataset_train: {}, dataset_test: {}'.format(
         len(dataset_train) if dataset_train is not None else 0, len(dataset_test)))
     if not args.test_only and len(data_loader_train) == 0:
@@ -826,7 +599,7 @@ def main():
 
     # model
 
-    model, inputs = create_model_and_inputs(args, num_classes)
+    model, inputs = create_model_and_inputs(args)
     if distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
@@ -855,7 +628,7 @@ def main():
             data_loader_test = torch.utils.data.DataLoader(
                 dataset_test, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.workers, pin_memory=True)
-            test(model, dataset_type, data_loader_test, inputs, args, logger)
+            test(model, data_loader_test, inputs, args, logger)
         return
 
     if not args.not_prune_neuron:
@@ -1130,7 +903,7 @@ def main():
     if not is_main_process():
         return
     del model, model_without_ddp
-    model, inputs = create_model_and_inputs(args, num_classes)
+    model, inputs = create_model_and_inputs(args)
     model.eval()
     with torch.no_grad():
         model(inputs)
@@ -1152,7 +925,7 @@ def main():
 
     logger.info('Test start')
     if is_main_process():
-        test(model, dataset_type, data_loader_test, inputs, args, logger)
+        test(model, data_loader_test, inputs, args, logger)
     logger.info('All Done.')
 
 
