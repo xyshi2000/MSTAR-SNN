@@ -1,7 +1,7 @@
 import logging
+import json
 import os
 import random
-from typing import Union
 import torch
 import torch.utils.data
 import numpy as np
@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colors
 
 from models import sew_resnet
+from mstar_data import load_mstar
 from models.submodules.sparse import ConvBlock, Mask
 from sparsity.penalty_term import PenaltyTerm
 from sparsity.temp_scheduler import TemperatureScheduler
@@ -46,7 +47,7 @@ def parse_args(argv=None):
     parser.add_argument('--T', default=4, type=int, help='simulation steps')
     parser.add_argument('--model', default='sew_resnet18_cifar', help='model type')
     parser.add_argument('--dataset', default='CIFAR10',
-                        help='CIFAR10, CIFAR10-128, CIFAR100, CIFAR10DVS or ImageNet')
+                        help='CIFAR10, CIFAR10-128, CIFAR100, CIFAR10DVS, ImageNet or MSTAR')
     parser.add_argument('--augment', action='store_true', default=True, help='Additional augment')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('--workers', default=16, type=int, metavar='N',
@@ -140,6 +141,8 @@ def parse_args(argv=None):
     parser.add_argument('--TET-lambda', type=float, default=0.0)
 
     parser.add_argument('--save-latest', action='store_true')
+    parser.add_argument('--eval-final-only', action='store_true',
+                        help='Evaluate test data only after the final training phase')
 
     # Register explicit negative forms for every existing boolean option.
     for action in list(parser._actions):
@@ -183,6 +186,18 @@ def parse_args(argv=None):
         parser.error('--mask-init-factor requires <neurons mean> <neurons std>')
     if not isinstance(args.temp_scheduler, list) or len(args.temp_scheduler) not in (2, 4):
         parser.error('--temp-scheduler requires 2 or 4 values')
+    if args.resume_type not in ('search', 'finetune', 'test'):
+        parser.error('--resume-type must be search, finetune or test')
+    if args.test_only and (not args.resume or args.resume_type != 'test'):
+        parser.error('--test-only requires --resume and --resume-type test')
+    if args.resume and args.resume_type == 'test' and not args.test_only:
+        parser.error('--resume-type test requires --test-only')
+    if not args.resume and args.resume_type != 'test':
+        parser.error('--resume-type search/finetune requires --resume')
+    if args.epoch_search < 0 or args.epoch_finetune < -1:
+        parser.error('Invalid epoch count')
+    if args.T < 1 or args.batch_size < 1 or args.accumulate_step < 1:
+        parser.error('T, batch-size and accumulate-step must be positive')
     return args
 
 
@@ -424,7 +439,21 @@ def _load_basic_data(dataset_dir, cache_dataset, dataset_type, distributed: bool
 def load_data(dataset_dir, dataset_type, distributed, args, logger=None):
     logger = logger or logging.getLogger(__name__)
     augment = args.augment and not args.no_aug
-    if dataset_type == 'ImageNet' and args.advanced_aug:
+    if dataset_type == 'MSTAR':
+        dataset_train, dataset_test, args.mstar_metadata = load_mstar(
+            dataset_dir, augment, getattr(args, 'mstar_metadata', None), args.test_only)
+        data_loader_train = None
+        if dataset_train is not None:
+            sampler = (torch.utils.data.distributed.DistributedSampler(dataset_train)
+                       if distributed else torch.utils.data.RandomSampler(dataset_train))
+            data_loader_train = torch.utils.data.DataLoader(
+                dataset_train, batch_size=args.batch_size, sampler=sampler,
+                num_workers=args.workers, pin_memory=True, drop_last=True)
+        # Final evaluation runs on rank zero over the complete test split.
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
+    elif dataset_type == 'ImageNet' and args.advanced_aug:
         # Optional dependency: the basic recipes do not require timm.
         from timm.data import create_loader
         dataset_train = torchvision.datasets.ImageFolder(os.path.join(dataset_dir, 'train'))
@@ -606,12 +635,18 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
     sops = 0
     for name in mon.monitored_layers:
         sublist = mon[name]
-        sop = torch.cat(sublist).mean().item()
+        sop = torch.cat(sublist).sum().item()
         sops = sops + sop
     sops = sops / (1000**3)
     # input is [N, C, H, W] or [T*N, C, H, W]
-    sops = sops / args.batch_size
+    sops = sops / len(data_loader_test.dataset)
     logger.info('Avg SOPs: {:.5f} G, Power: {:.5f} mJ.'.format(sops, 0.9 * sops))
+    with open(os.path.join(args.output_dir, 'test', 'metrics.json'), 'w', encoding='utf-8') as file:
+        json.dump({'accuracy_top1': metric_dict['acc@1'].ave,
+                   'accuracy_top5': metric_dict['acc@5'].ave,
+                   'accuracy_unit': 'percent', 'n': len(data_loader_test.dataset),
+                   'neurons_left': neuron_left, 'neurons_total': neuron_total,
+                   'sops_g_per_image': sops}, file, indent=2)
     #logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
 
     #
@@ -633,7 +668,7 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
                 num = mask.numel()
                 logger.info('layer [{}] {}: left: {}, total: {}, percentage: {:.2f}%'.format(
                     idx, name, num_active, num, 100 * num_active / num))
-                mask.squeeze_(0).squeeze_(0)
+                mask = mask.squeeze(0).squeeze(0)
                 channels = mask.shape[0]
                 ncols = int(sqrt(channels))
                 nrows = ceil(channels / ncols)
@@ -658,6 +693,23 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
         plt.close()
 
 
+def create_model_and_inputs(args, num_classes):
+    """Use the same architecture and mask geometry for training and evaluation."""
+    if args.model not in sew_resnet.__all__:
+        raise ValueError('Unsupported model: {}'.format(args.model))
+    model = sew_resnet.__dict__[args.model](
+        zero_init_residual=args.zero_init_residual, T=args.T, num_classes=num_classes,
+        in_channels=1 if args.dataset == 'MSTAR' else 3).cuda()
+    if args.not_prune_neuron:
+        for module in model.modules():
+            if isinstance(module, ConvBlock):
+                module.sparse_neurons = False
+    shapes = {'CIFAR10': (1, 3, 32, 32), 'CIFAR100': (1, 3, 32, 32),
+              'CIFAR10-128': (1, 3, 128, 128), 'CIFAR10DVS': (1, 1, 2, 48, 48),
+              'ImageNet': (1, 3, 224, 224), 'MSTAR': (1, 1, 128, 128)}
+    return model, torch.rand(*shapes[args.dataset], device='cuda')
+
+
 def main():
 
     ##################################################
@@ -665,6 +717,22 @@ def main():
     ##################################################
 
     args = parse_args()
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
+        saved_config = resume_checkpoint.get('config', {})
+        # Restore fields needed to reconstruct the network and evaluation protocol.
+        for key in ('dataset', 'model', 'T', 'not_prune_neuron', 'zero_init_residual',
+                    'eval_final_only'):
+            if key in saved_config:
+                setattr(args, key, saved_config[key])
+        args.mstar_metadata = resume_checkpoint.get('mstar_metadata')
+        if args.dataset == 'MSTAR' and args.mstar_metadata is None:
+            raise ValueError('MSTAR checkpoint is missing preprocessing metadata')
+        if not args.test_only and resume_checkpoint.get('phase', args.resume_type) != args.resume_type:
+            raise ValueError('Resume type does not match checkpoint phase')
+    if not args.test_only and not args.resume and args.epoch_search == 0:
+        raise ValueError('At least one search/training epoch is required for a fresh run')
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -683,33 +751,30 @@ def main():
     # load data
 
     dataset_type = args.dataset
-    if dataset_type in ('CIFAR10', 'CIFAR10-128', 'CIFAR10DVS'):
+    if dataset_type in ('CIFAR10', 'CIFAR10-128', 'CIFAR10DVS', 'MSTAR'):
         num_classes = 10
     elif dataset_type == 'CIFAR100':
         num_classes = 100
     elif dataset_type == 'ImageNet':
         num_classes = 1000
+    else:
+        raise ValueError('Unsupported dataset: {}'.format(dataset_type))
 
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, dataset_type, distributed, args, logger)
-    logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
+    logger.info('dataset_train: {}, dataset_test: {}'.format(
+        len(dataset_train) if dataset_train is not None else 0, len(dataset_test)))
+    if not args.test_only and len(data_loader_train) == 0:
+        raise ValueError('Training loader is empty; reduce batch-size')
+    if not args.test_only and len(data_loader_train) < args.accumulate_step:
+        raise ValueError('accumulate-step exceeds the number of training batches')
+    if is_main_process():
+        with open(os.path.join(args.output_dir, 'config.json'), 'w', encoding='utf-8') as file:
+            json.dump(vars(args), file, indent=2, ensure_ascii=False)
 
     # model
 
-    model: Union[sew_resnet.SEWResNet_ImageNet,
-                 sew_resnet.SEWResNet_CIFAR, sew_resnet.ResNet19]
-    if args.model in sew_resnet.__dict__:
-        model = sew_resnet.__dict__[args.model](zero_init_residual=args.zero_init_residual,
-                                                T=args.T, num_classes=num_classes).cuda()
-    else:
-        raise NotImplementedError(args.model)
-
-    if args.not_prune_neuron:
-        for m in model.modules():
-            if isinstance(m, ConvBlock):
-                m.sparse_neurons = False
-
-    model.cuda()
+    model, inputs = create_model_and_inputs(args, num_classes)
     if distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
@@ -726,19 +791,20 @@ def main():
     # init mask
 
     set_pruning_mode(model, True)
-    if dataset_type == 'CIFAR10' or dataset_type == 'CIFAR100':
-        inputs = torch.rand(1, 3, 32, 32).cuda()
-    elif dataset_type == 'CIFAR10-128':
-        inputs = torch.rand(1, 3, 128, 128).cuda()
-    elif dataset_type == 'CIFAR10DVS':
-        inputs = torch.rand(1, 1, 2, 48, 48).cuda()
-    elif dataset_type == 'ImageNet':
-        inputs = torch.rand(1, 3, 224, 224).cuda()
     _ = model(inputs)
 
     masks = init_mask(model, *args.mask_init_factor)
     set_pruning_mode(model, False)
     functional.reset_net(model)
+
+    if args.test_only:
+        model.load_state_dict(resume_checkpoint['model'])
+        if is_main_process():
+            data_loader_test = torch.utils.data.DataLoader(
+                dataset_test, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.workers, pin_memory=True)
+            test(model, dataset_type, data_loader_test, inputs, args, logger)
+        return
 
     if not args.not_prune_neuron:
         if args.prune_optimizer is None:
@@ -783,7 +849,7 @@ def main():
 
     # threshold scheduler
 
-    if not args.not_prune_neuron:
+    if pruning_enabled and args.resume_type != 'finetune':
         iter_per_epoch = len(data_loader_train) // args.accumulate_step
         if len(args.temp_scheduler) == 2:
             (args.temp_scheduler).append(0)
@@ -799,9 +865,11 @@ def main():
     # resume
 
     if args.resume and args.resume_type == 'search':
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = resume_checkpoint
         model_without_ddp.load_state_dict(checkpoint['model'])
         optimizer_train.load_state_dict(checkpoint['optimizer_train'])
+        if scaler is not None and checkpoint.get('scaler') is not None:
+            scaler.load_state_dict(checkpoint['scaler'])
         if optimizer_prune is not None:
             optimizer_prune.load_state_dict(checkpoint['optimizer_prune'])
         start_epoch = checkpoint['epoch']
@@ -820,19 +888,6 @@ def main():
         max_acc1 = 0
 
     logger.debug(str(model))
-
-    ##################################################
-    #                   test only
-    ##################################################
-
-    if args.test_only:
-        if args.resume and args.resume_type == 'test':
-            checkpoint = torch.load(args.resume, map_location='cpu')
-            model_without_ddp.load_state_dict(checkpoint['model'])
-        logger.info('Test start')
-        if is_main_process():
-            test(model, dataset_type, data_loader_test, inputs, args, logger)
-        return
 
     ##################################################
     #                   search
@@ -869,13 +924,16 @@ def main():
                 if m.mask_value is not None:
                     logger.debug(' {}: {:.3}%'.format(n, m.mask().mean() * 100))
 
-        with Timer(' Test', logger):
-            logger.debug('[Test with continuous mask]')
-            test_loss_c, test_acc1_c, test_acc5_c = evaluate(model, criterion_eval, data_loader_test,
-                                                             args.print_freq, logger, True)
-            logger.debug('[Test with binary mask]')
-            test_loss_s, test_acc1_s, test_acc5_s = evaluate(model, criterion_eval, data_loader_test,
-                                                             args.print_freq, logger, False)
+        test_loss_c = test_acc1_c = test_acc5_c = None
+        test_loss_s = test_acc1_s = test_acc5_s = None
+        if not args.eval_final_only:
+            with Timer(' Test', logger):
+                logger.debug('[Test with continuous mask]')
+                test_loss_c, test_acc1_c, test_acc5_c = evaluate(model, criterion_eval, data_loader_test,
+                                                                 args.print_freq, logger, True)
+                logger.debug('[Test with binary mask]')
+                test_loss_s, test_acc1_s, test_acc5_s = evaluate(model, criterion_eval, data_loader_test,
+                                                                 args.print_freq, logger, False)
         set_pruning_mode(model, True)
         n_l, n_t = left_neurons(model)
         neu = 100 * (n_l + 1e-10) / (n_t + 1e-10)
@@ -883,10 +941,11 @@ def main():
                          test_acc1_c, test_acc5_c, test_loss_s, test_acc1_s, test_acc5_s, epoch,
                          args.tb_interval)
 
-        logger.info(' Test (continuous mask) Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
-            test_acc1_c, test_acc5_c))
-        logger.info(' Test (binary mask) Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
-            test_acc1_s, test_acc5_s))
+        if not args.eval_final_only:
+            logger.info(' Test (continuous mask) Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
+                test_acc1_c, test_acc5_c))
+            logger.info(' Test (binary mask) Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
+                test_acc1_s, test_acc5_s))
         logger.info(' left neurons: {:.2f}%'.format(neu))
 
         checkpoint = {
@@ -894,7 +953,11 @@ def main():
             'optimizer_train': optimizer_train.state_dict(),
             'optimizer_prune': optimizer_prune.state_dict() if optimizer_prune is not None else None,
             'epoch': epoch,
-            'max_acc1': max_acc1, }
+            'max_acc1': max_acc1,
+            'config': vars(args).copy(),
+            'mstar_metadata': getattr(args, 'mstar_metadata', None),
+            'scaler': scaler.state_dict() if scaler is not None else None,
+            'phase': 'search', }
         if lr_scheduler_train is not None:
             checkpoint['lr_scheduler_train'] = lr_scheduler_train.state_dict()
             if lr_scheduler_prune is not None:
@@ -924,9 +987,11 @@ def main():
     # resume
 
     if args.resume and args.resume_type == 'finetune':
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = resume_checkpoint
         model_without_ddp.load_state_dict(checkpoint['model'])
         optimizer_train.load_state_dict(checkpoint['optimizer_train'])
+        if scaler is not None and checkpoint.get('scaler') is not None:
+            scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch']
         max_acc1 = checkpoint['max_acc1']
         if lr_scheduler_train is not None:
@@ -954,25 +1019,32 @@ def main():
             if lr_scheduler_train is not None and lr_scheduler_T0 <= epoch < lr_scheduler_Tmax:
                 lr_scheduler_train.step()
 
-        with Timer(' Test', logger):
-            logger.debug('[Test]')
-            test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                       args.print_freq, logger, False)
+        test_loss = test_acc1 = test_acc5 = None
+        if not args.eval_final_only:
+            with Timer(' Test', logger):
+                logger.debug('[Test]')
+                test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
+                                                           args.print_freq, logger, False)
 
         finetune_tb_record(tb_writer, train_loss, train_acc1, train_acc5, test_loss, test_acc1,
                            test_acc5, epoch)
 
-        logger.info(' Test Acc@1: {:.5f}, Acc@5: {:.5f}'.format(test_acc1, test_acc5))
+        if not args.eval_final_only:
+            logger.info(' Test Acc@1: {:.5f}, Acc@5: {:.5f}'.format(test_acc1, test_acc5))
 
-        if max_acc1 < test_acc1:
-            max_acc1 = test_acc1
-            save_max = True
+            if max_acc1 < test_acc1:
+                max_acc1 = test_acc1
+                save_max = True
 
         checkpoint = {
             'model': model_without_ddp.state_dict(),
             'optimizer_train': optimizer_train.state_dict(),
             'epoch': epoch,
-            'max_acc1': max_acc1, }
+            'max_acc1': max_acc1,
+            'config': vars(args).copy(),
+            'mstar_metadata': getattr(args, 'mstar_metadata', None),
+            'scaler': scaler.state_dict() if scaler is not None else None,
+            'phase': 'finetune', }
         if lr_scheduler_train is not None:
             checkpoint['lr_scheduler_train'] = lr_scheduler_train.state_dict()
 
@@ -983,6 +1055,8 @@ def main():
             save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'))
 
     logger.info('Finetune finish.')
+    # Also materialize the final checkpoint when resuming an already completed phase.
+    save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_final.pth'))
 
     ##################################################
     #                   test
@@ -992,40 +1066,24 @@ def main():
 
     # reset model
 
-    del model, model_without_ddp
-
-    if args.model in sew_resnet.__dict__:
-        model = sew_resnet.__dict__[args.model](zero_init_residual=args.zero_init_residual,
-                                                T=args.T, num_classes=num_classes).cuda()
-    if args.not_prune_neuron:
-        for m in model.modules():
-            if isinstance(m, ConvBlock):
-                m.sparse_neurons = False
-
-    model.cuda()
-
-    # init mask
-
-    if dataset_type == 'CIFAR10' or dataset_type == 'CIFAR100':
-        inputs = torch.rand(1, 3, 32, 32).cuda()
-    elif dataset_type == 'CIFAR10-128':
-        inputs = torch.rand(1, 3, 128, 128).cuda()
-    elif dataset_type == 'CIFAR10DVS':
-        inputs = torch.rand(1, 1, 2, 48, 48).cuda()
-    elif dataset_type == 'ImageNet':
-        inputs = torch.rand(1, 3, 224, 224).cuda()
-    _ = model(inputs)
-
-    masks = init_mask(model, 1, 0)
-    functional.reset_net(model)
-
-    try:
-        checkpoint = torch.load(os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'),
-                                map_location='cpu')
-    except:
-        logger.warning('Cannot load max acc1 model, skip test.')
-        logger.warning('Exit.')
+    selected = ('checkpoint_final.pth' if args.eval_final_only or args.epoch_finetune <= 0
+                else 'checkpoint_max_acc1.pth')
+    # All ranks must finish saving before the final checkpoint is loaded.
+    if distributed:
+        torch.distributed.barrier()
+    checkpoint_path = os.path.join(args.output_dir, selected)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    if tb_writer is not None:
+        tb_writer.close()
+    if not is_main_process():
         return
+    del model, model_without_ddp
+    model, inputs = create_model_and_inputs(args, num_classes)
+    model.eval()
+    with torch.no_grad():
+        model(inputs)
+    init_mask(model, 1, 0)
+    functional.reset_net(model)
 
     model.load_state_dict(checkpoint['model'])
 

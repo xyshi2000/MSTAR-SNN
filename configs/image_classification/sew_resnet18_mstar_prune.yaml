@@ -1,0 +1,29 @@
+# Starting pruning recipe; tune penalty_lmbda for the desired sparsity/accuracy.
+model: sew_resnet18_imagenet
+dataset: MSTAR
+data_path: ./datasets/MSTAR/soc
+output_dir: ./logs/sew_resnet18_mstar_prune
+seed: 0
+T: 4
+batch_size: 64
+workers: 4
+augment: true
+epoch_search: 100
+epoch_finetune: 40
+optimizer: AdamW
+search_lr: 0.001
+finetune_lr: 0.001
+weight_decay: 0.0001
+search_lr_scheduler: [Cosine]
+finetune_lr_scheduler: [Cosine]
+amp: true
+TET: false
+not_prune_neuron: false
+prune_optimizer: null
+prune_lr: null
+prune_weight_decay: 0.0
+mask_init_factor: [0, 0]
+penalty_lmbda: 1.0e-7
+temp_scheduler: [5, 1000]
+eval_final_only: true
+save_latest: true

@@ -54,12 +54,13 @@ def search_tb_record(tb_writer: SummaryWriter, model: nn.Module, train_loss, tra
         tb_writer.add_scalar('search/train/loss', train_loss, epoch)
         tb_writer.add_scalar('search/train/acc1', train_acc1, epoch)
         tb_writer.add_scalar('search/train/acc5', train_acc5, epoch)
-        tb_writer.add_scalar('search/test/continuous/loss', test_loss_c, epoch)
-        tb_writer.add_scalar('search/test/continuous/acc1', test_acc1_c, epoch)
-        tb_writer.add_scalar('search/test/continuous/acc5', test_acc5_c, epoch)
-        tb_writer.add_scalar('search/test/binary/loss', test_loss_s, epoch)
-        tb_writer.add_scalar('search/test/binary/acc1', test_acc1_s, epoch)
-        tb_writer.add_scalar('search/test/binary/acc5', test_acc5_s, epoch)
+        if test_loss_c is not None:
+            tb_writer.add_scalar('search/test/continuous/loss', test_loss_c, epoch)
+            tb_writer.add_scalar('search/test/continuous/acc1', test_acc1_c, epoch)
+            tb_writer.add_scalar('search/test/continuous/acc5', test_acc5_c, epoch)
+            tb_writer.add_scalar('search/test/binary/loss', test_loss_s, epoch)
+            tb_writer.add_scalar('search/test/binary/acc1', test_acc1_s, epoch)
+            tb_writer.add_scalar('search/test/binary/acc5', test_acc5_s, epoch)
 
         neu_cnt, neu_total = 0, 0
         for name, module in model.named_modules():
@@ -84,9 +85,10 @@ def finetune_tb_record(tb_writer: SummaryWriter, train_loss, train_acc1, train_a
         tb_writer.add_scalar('finetune/train/loss', train_loss, epoch)
         tb_writer.add_scalar('finetune/train/acc1', train_acc1, epoch)
         tb_writer.add_scalar('finetune/train/acc5', train_acc5, epoch)
-        tb_writer.add_scalar('finetune/test/loss', test_loss, epoch)
-        tb_writer.add_scalar('finetune/test/acc1', test_acc1, epoch)
-        tb_writer.add_scalar('finetune/test/acc5', test_acc5, epoch)
+        if test_loss is not None:
+            tb_writer.add_scalar('finetune/test/loss', test_loss, epoch)
+            tb_writer.add_scalar('finetune/test/acc1', test_acc1, epoch)
+            tb_writer.add_scalar('finetune/test/acc5', test_acc5, epoch)
 
 
 def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1, )):

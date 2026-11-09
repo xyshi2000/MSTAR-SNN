@@ -3,7 +3,7 @@ import torch.nn as nn
 from spikingjelly.activation_based import layer
 from spikingjelly.activation_based import surrogate, neuron, functional
 from .submodules.sparse import ConvBlock
-from .submodules.layers import conv1x1, conv3x3, create_msif, create_mslif
+from .submodules.layers import conv1x1, conv3x3, create_mslif
 from typing import Union, List
 
 __all__ = [
@@ -21,7 +21,7 @@ class BasicBlock(nn.Module):
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         if activation is None:
-            activation = create_msif
+            activation = create_mslif
         if groups != 1 or base_width != 64:
             raise ValueError('SpikingBasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
@@ -55,7 +55,7 @@ class Bottleneck(nn.Module):
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         if activation is None:
-            activation = create_msif
+            activation = create_mslif
         width = int(planes * (base_width / 64.)) * groups
 
         self.downsample = downsample
@@ -84,7 +84,7 @@ class Bottleneck(nn.Module):
 class SEWResNet_ImageNet(nn.Module):
     def __init__(self, block: Union[BasicBlock, Bottleneck], layers: List[int], num_classes=1000,
                  zero_init_residual=False, groups=1, width_per_group=64,
-                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=4):
+                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=4, in_channels=3):
         super(SEWResNet_ImageNet, self).__init__()
         self.skip = ['conv1']
 
@@ -103,8 +103,8 @@ class SEWResNet_ImageNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
         self.conv1 = ConvBlock(
-            nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
-            norm_layer(self.inplanes), create_msif(), static=True, T=T,
+            nn.Conv2d(in_channels, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
+            norm_layer(self.inplanes), create_mslif(), static=True, T=T,
             sparse_neurons=False)
         self.maxpool = layer.SeqToANNContainer(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
 
@@ -153,7 +153,7 @@ class SEWResNet_ImageNet(nn.Module):
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = ConvBlock(conv1x1(self.inplanes, planes * block.expansion, stride),
-                                   norm_layer(planes * block.expansion), create_msif(),
+                                   norm_layer(planes * block.expansion), create_mslif(),
                                    sparse_neurons=True)
 
         layers: List[Union[BasicBlock, Bottleneck]] = []
@@ -194,7 +194,7 @@ class SEWResNet_ImageNet(nn.Module):
 class SEWResNet_CIFAR(nn.Module):
     def __init__(self, block: Union[BasicBlock, Bottleneck], layers: List[int], num_classes=10,
                  zero_init_residual=False, groups=1, width_per_group=64,
-                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=4):
+                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=4, in_channels=3):
         super(SEWResNet_CIFAR, self).__init__()
         self.skip = ['conv1']
 
@@ -212,7 +212,7 @@ class SEWResNet_CIFAR(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = ConvBlock(conv3x3(3, self.inplanes), norm_layer(self.inplanes), create_mslif(),
+        self.conv1 = ConvBlock(conv3x3(in_channels, self.inplanes), norm_layer(self.inplanes), create_mslif(),
                                static=True, T=T, sparse_neurons=False)
 
         self.layer1 = self._make_layer(block, 64, layers[0])
@@ -260,7 +260,7 @@ class SEWResNet_CIFAR(nn.Module):
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = ConvBlock(conv1x1(self.inplanes, planes * block.expansion, stride),
-                                   norm_layer(planes * block.expansion), create_msif(),
+                                   norm_layer(planes * block.expansion), create_mslif(),
                                    sparse_neurons=True)
 
         layers: List[Union[BasicBlock, Bottleneck]] = []
@@ -300,7 +300,7 @@ class SEWResNet_CIFAR(nn.Module):
 class ResNet19(nn.Module):
     def __init__(self, block: Union[BasicBlock, Bottleneck], layers: List[int], num_classes=10,
                  zero_init_residual=False, groups=1, width_per_group=64,
-                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=2):
+                 replace_stride_with_dilation=None, norm_layer: nn.Module = None, T=2, in_channels=3):
         super(ResNet19, self).__init__()
         self.skip = ['conv1']
 
@@ -319,7 +319,7 @@ class ResNet19(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = ConvBlock(conv3x3(3, self.inplanes), norm_layer(self.inplanes), create_mslif(),
+        self.conv1 = ConvBlock(conv3x3(in_channels, self.inplanes), norm_layer(self.inplanes), create_mslif(),
                                static=True, T=T, sparse_neurons=False)
         self.layer1 = self._make_layer(block, 128, layers[0])
         self.layer2 = self._make_layer(block, 256, layers[1], stride=2,

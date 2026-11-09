@@ -2,11 +2,6 @@ import torch.nn as nn
 from spikingjelly.activation_based import surrogate, neuron
 
 
-def create_msif():
-    return neuron.IFNode(v_threshold=1., v_reset=0., surrogate_function=surrogate.ATan(),
-                         detach_reset=True, step_mode='m', backend='cupy')
-
-
 def create_mslif(v_threshold=1., v_reset=0., tau=2., surrogate_function=surrogate.ATan(),
                  detach_reset=True):
     return neuron.LIFNode(v_threshold=v_threshold, v_reset=v_reset, tau=tau,
