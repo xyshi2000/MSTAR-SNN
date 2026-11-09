@@ -9,10 +9,10 @@ batch_size: 64
 workers: 4
 augment: true
 epoch_search: 100
-epoch_finetune: 40
+epoch_finetune: 20
 optimizer: AdamW
 search_lr: 0.001
-finetune_lr: 0.001
+finetune_lr: 0.0001
 weight_decay: 0.0001
 search_lr_scheduler: [Cosine]
 finetune_lr_scheduler: [Cosine]
@@ -23,7 +23,7 @@ prune_optimizer: null
 prune_lr: null
 prune_weight_decay: 0.0
 mask_init_factor: [0, 0]
-penalty_lmbda: 1.0e-7
+penalty_lmbda: 1.0e-5
 temp_scheduler: [5, 1000]
 eval_final_only: true
 save_latest: true
