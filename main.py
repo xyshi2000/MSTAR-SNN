@@ -593,17 +593,35 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
     safe_makedirs(os.path.join(args.output_dir, 'test'))
 
     set_pruning_mode(model, False)
+    model.eval()
+    neuron_left, neuron_total = 0, 0
+
+    def count_neurons(module, block_inputs, output):
+        nonlocal neuron_left, neuron_total
+        # Count spatial LIF units once, independent of batch size and time steps.
+        count = output[0, 0].numel()
+        neuron_total += count
+        mask = module.neuron_mask.mask_value
+        neuron_left += int((mask > 0).sum().item()) if mask is not None else count
+
+    hooks = [module.register_forward_hook(count_neurons) for module in model.modules()
+             if isinstance(module, ConvBlock) and module.node is not None]
+    try:
+        with torch.no_grad():
+            model(inputs)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        functional.reset_net(model)
     mon = SOPMonitor(model)
 
     logger.info('[Sparsity]')
 
-    neuron_left, neuron_total = left_neurons(model)
-    logger.info('Neurons: left: {:.2e}, total: {:.2e}, percentage: {:.2f}%'.format(
-        neuron_left, neuron_total, (neuron_left + 1e-10) / (neuron_total + 1e-10) * 100))
+    logger.info('Neurons: before pruning: {:d}, after pruning: {:d}, remaining: {:.2f}%'.format(
+        neuron_total, neuron_left, 100 * neuron_left / neuron_total if neuron_total else 100.0))
 
     logger.info('[Efficiency]')
 
-    model.eval()
     mon.enable()
     logger.debug('Test start')
     metric_dict = RecordDict({'acc@1': None, 'acc@5': None}, test=True)

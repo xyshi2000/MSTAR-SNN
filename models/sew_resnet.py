@@ -105,7 +105,7 @@ class SEWResNet_ImageNet(nn.Module):
         self.conv1 = ConvBlock(
             nn.Conv2d(in_channels, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
             norm_layer(self.inplanes), create_mslif(), static=True, T=T,
-            sparse_neurons=False)
+            sparse_neurons=True)
         self.maxpool = layer.SeqToANNContainer(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
 
         self.layer1 = self._make_layer(block, 64, layers[0])
@@ -213,7 +213,7 @@ class SEWResNet_CIFAR(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
         self.conv1 = ConvBlock(conv3x3(in_channels, self.inplanes), norm_layer(self.inplanes), create_mslif(),
-                               static=True, T=T, sparse_neurons=False)
+                               static=True, T=T, sparse_neurons=True)
 
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -320,7 +320,7 @@ class ResNet19(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
         self.conv1 = ConvBlock(conv3x3(in_channels, self.inplanes), norm_layer(self.inplanes), create_mslif(),
-                               static=True, T=T, sparse_neurons=False)
+                               static=True, T=T, sparse_neurons=True)
         self.layer1 = self._make_layer(block, 128, layers[0])
         self.layer2 = self._make_layer(block, 256, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
