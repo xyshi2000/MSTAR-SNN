@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import random
+import time
 import torch
 import torch.utils.data
 import numpy as np
@@ -588,6 +589,31 @@ def evaluate(model, criterion, data_loader, print_freq, logger, prune):
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
 
+def measure_inference_time(model, data_loader, warmup_steps=5):
+    """Measure synchronized model execution, amortized over actual sample count."""
+    model.eval()
+    elapsed_seconds = 0.0
+    samples = 0
+    with torch.no_grad():
+        for image, _ in data_loader:
+            image = image.cuda()
+            if samples == 0:
+                for _ in range(warmup_steps):
+                    model(image).mean(0)
+                    functional.reset_net(model)
+            # Exclude loading and host-to-device transfer from the timed region.
+            torch.cuda.synchronize(image.device)
+            start = time.perf_counter()
+            model(image).mean(0)
+            functional.reset_net(model)
+            torch.cuda.synchronize(image.device)
+            elapsed_seconds += time.perf_counter() - start
+            samples += image.shape[0]
+    if samples == 0:
+        raise ValueError('Cannot measure inference time on an empty dataset')
+    return elapsed_seconds * 1000 / samples
+
+
 def test(model, dataset_type, data_loader_test, inputs, args, logger):
 
     safe_makedirs(os.path.join(args.output_dir, 'test'))
@@ -659,11 +685,19 @@ def test(model, dataset_type, data_loader_test, inputs, args, logger):
     # input is [N, C, H, W] or [T*N, C, H, W]
     sops = sops / len(data_loader_test.dataset)
     logger.info('Avg SOPs: {:.5f} G, Power: {:.5f} mJ.'.format(sops, 0.9 * sops))
+    # Benchmark separately so SOP hooks and metric calculation do not affect timing.
+    mon.remove_hooks()
+    inference_time_ms = measure_inference_time(model, data_loader_test)
+    logger.info('Avg inference time: {:.6f} ms/sample (batch size: {}, warmup: 5 batches)'.format(
+        inference_time_ms, args.batch_size))
     with open(os.path.join(args.output_dir, 'test', 'metrics.json'), 'w', encoding='utf-8') as file:
         json.dump({'accuracy_top1': metric_dict['acc@1'].ave,
                    'accuracy_top5': metric_dict['acc@5'].ave,
                    'accuracy_unit': 'percent', 'n': len(data_loader_test.dataset),
                    'neurons_left': neuron_left, 'neurons_total': neuron_total,
+                   'inference_time_ms_per_sample': inference_time_ms,
+                   'inference_batch_size': args.batch_size,
+                   'inference_warmup_steps': 5,
                    'sops_g_per_image': sops}, file, indent=2)
     #logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
 

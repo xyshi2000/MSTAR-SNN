@@ -71,6 +71,14 @@ MSTAR 配置开启 `eval_final_only`：训练和微调期间不读取测试图�
 剪枝模型还会输出掩码可视化。TensorBoard 在仅最终评估模式下只记录训练和稀疏指标。
 运行实验时使用独立输出目录，避免混入旧实验文件。
 
+评估还会单独遍历测试集测量平均推理时间，在日志和 `test/metrics.json` 的
+`inference_time_ms_per_sample` 输出毫秒/样本。计时前移除 SOP 统计钩子，使用首批
+输入预热 5 次，每批计时前后同步 CUDA。计时包含全部 T 步前向、logits 时间平均和
+膜电位重置，不包含数据加载、CPU 到 GPU 传输、指标计算或可视化，使用 FP32。
+平均值为所有计时批次总耗时除以实际样本总数，包含不足整批的尾批；同时保存
+`inference_batch_size` 和 `inference_warmup_steps`。默认是批量推理摊到每个样本的
+耗时；测量逐个样本推理延迟时，在独立评估命令中指定 `--batch-size 1`。
+
 ## 恢复与独立评估
 
 恢复时使用原实验 YAML 和对应阶段。`checkpoint_latest.pth` 的 `phase` 是 `search`
