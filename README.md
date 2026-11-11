@@ -26,10 +26,16 @@ soc/
 训练与测试必须具有相同的十类类别及标签映射。标准 SOC 数据为 17° 训练集 2747 张、
 15° 测试集 2425 张。代码允许同样十类结构的子集用于短程检查，不按样本总数限制读取。
 
-预处理沿用本地 `mstar-ann-snn-baseline`：灰度单通道、128×128 中心裁剪，只用训练集
-计算均值和标准差；训练时增加反射填充 4 像素后的随机裁剪，不做翻转或颜色增强。
+预处理使用灰度单通道，`--input-size S`（或 YAML 的 `input_size`）指定正方形输入边长，
+默认 128。原图短边大于或等于 S 时直接中心裁切；短边小于 S 时，先用双线性插值
+等比例放大至短边为 S，再中心裁切。所有图像统一输出 S×S，不因原图尺寸不同而影响组批。
+只用经过上述尺寸处理的训练图像计算均值和标准差；训练时增加反射填充 4 像素后的
+随机裁剪，仍输出 S×S，不做翻转或颜色增强。
 `--no-aug` 可关闭平移增强。预处理参数和类别映射保存在 `config.json` 与 checkpoint
-的 `mstar_metadata` 字段中，恢复及独立评估使用这些参数并核对类别。
+的 `mstar_metadata` 字段中，恢复及独立评估使用这些参数并核对类别；输入边长和缩放策略
+以 checkpoint 为准。旧 checkpoint 未记录缩放策略时，保留其原来的中心裁切行为。
+模型和剪枝掩码按实际输入尺寸初始化。例如，输入边长为 160 时，在训练命令后加
+`--input-size 160`。
 
 默认模型为单通道 `sew_resnet18`，使用标准 7×7 stem、LIF 脉冲神经元
 和十类分类头（含原有 boost 读出）。所有 SEW 模型统一使用 LIF，默认 tau=2、阈值=1、
@@ -99,4 +105,4 @@ python main.py --test-only --resume logs/sew_resnet18_mstar_prune/checkpoint_fin
 ```
 
 短程检查可在训练命令后附加 `--epoch-search 1 --epoch-finetune 1`；普通训练使用
-`--epoch-search 1 --epoch-finetune 0`。本次整合未添加测试代码。
+`--epoch-search 1 --epoch-finetune 0`。

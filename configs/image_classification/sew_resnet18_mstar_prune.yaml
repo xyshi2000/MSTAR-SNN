@@ -2,6 +2,7 @@
 model: sew_resnet18
 dataset: MSTAR
 data_path: ./datasets/MSTAR/soc
+input_size: 128
 output_dir: ./logs/sew_resnet18_mstar_prune
 seed: 0
 T: 4

@@ -69,6 +69,8 @@ def parse_args(argv=None):
                         help='Number of times a debug message is printed in one epoch')
     parser.add_argument('--tb-interval', type=int, default=10)
     parser.add_argument('--data-path', default='./datasets/MSTAR/soc', help='dataset')
+    parser.add_argument('--input-size', default=128, type=int,
+                        help='square input side length; restored from checkpoint when resuming')
     parser.add_argument('--output-dir', default='./logs/temp')
     parser.add_argument('--resume', type=str, help='resume from checkpoint')
     parser.add_argument('--resume-type', type=str, default='test', help='search, finetune or test')
@@ -161,6 +163,8 @@ def parse_args(argv=None):
         parser.error('Invalid epoch count')
     if args.T < 1 or args.batch_size < 1 or args.accumulate_step < 1:
         parser.error('T, batch-size and accumulate-step must be positive')
+    if args.input_size < 1:
+        parser.error('--input-size must be positive')
     if args.dataset != 'MSTAR':
         parser.error('Only the MSTAR dataset is supported')
     args.model = args.model.removesuffix('_imagenet')
@@ -263,7 +267,8 @@ def init_distributed(logger: logging.Logger, distributed_init_mode):
 def load_data(dataset_dir, distributed, args):
     dataset_train, dataset_test, args.mstar_metadata = load_mstar(
         dataset_dir, args.augment and not args.no_aug,
-        getattr(args, 'mstar_metadata', None), args.test_only)
+        getattr(args, 'mstar_metadata', None), args.test_only, input_size=args.input_size)
+    args.input_size = args.mstar_metadata['input_size'][1]
     data_loader_train = None
     if dataset_train is not None:
         sampler = (torch.utils.data.distributed.DistributedSampler(dataset_train)
@@ -539,7 +544,7 @@ def create_model_and_inputs(args):
         for module in model.modules():
             if isinstance(module, ConvBlock):
                 module.sparse_neurons = False
-    return model, torch.rand(1, 1, 128, 128, device='cuda')
+    return model, torch.rand(1, *args.mstar_metadata['input_size'], device='cuda')
 
 
 def main():
